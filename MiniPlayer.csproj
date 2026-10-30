@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+    <AssemblyName>MiniPlayer</AssemblyName>
+    <RootNamespace>MiniPlayer</RootNamespace>
+    <!-- WPF needs DPI awareness in the manifest; this WinForms-only advice doesn't apply -->
+    <NoWarn>$(NoWarn);WFAC010</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- WPF's touch/stylus layer makes Windows refuse smooth touchpad pinch (DirectManipulation) on WPF windows.
+         The app has no touch UI, so turn it off. -->
+    <RuntimeHostConfigurationOption Include="Switch.System.Windows.Input.Stylus.DisableStylusAndTouchSupport" Value="true" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Logo: every Windows icon size, with a bolder variant for 16-24px (tray). -->
+    <Resource Include="Assets\app.ico" />
+  </ItemGroup>
+
+</Project>
