@@ -44,8 +44,35 @@ internal static class Native
     public const int WS_EX_TOOLWINDOW = 0x80;
     public const int WS_EX_TOPMOST = 0x8, WS_EX_TRANSPARENT = 0x20, WS_EX_LAYERED = 0x80000;
     public const uint LWA_ALPHA = 0x2;
-    public const int SW_RESTORE = 9, SW_SHOWNOACTIVATE = 4;
-    public const uint GW_HWNDNEXT = 2;
+    public const int SW_RESTORE = 9, SW_SHOWNOACTIVATE = 4, SW_HIDE = 0;
+    public const uint GW_HWNDNEXT = 2, GW_OWNER = 4;
+
+    // Raw input from the precision touchpad: the only way to see fingers landing (a starting
+    // pinch) before Windows picks which window gets the gesture.
+    public const int WM_INPUT = 0x00FF;
+    public const uint RID_INPUT = 0x10000003, RIDI_PREPARSEDDATA = 0x20000005;
+    public const uint RIDEV_INPUTSINK = 0x100, RIDEV_REMOVE = 0x1;
+    public const uint RawHeaderSize = 24; // RAWINPUTHEADER on x64
+    public const int RIM_TYPEHID = 2;
+    public const int HIDP_STATUS_SUCCESS = 0x00110000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RAWINPUTDEVICE
+    {
+        public ushort usUsagePage, usUsage;
+        public uint dwFlags;
+        public IntPtr hwndTarget;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern bool RegisterRawInputDevices(ref RAWINPUTDEVICE device, uint count, uint size);
+    [DllImport("user32.dll")]
+    public static extern uint GetRawInputData(IntPtr rawInput, uint command, byte[]? data, ref uint size, uint headerSize);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetRawInputDeviceInfo(IntPtr device, uint command, byte[]? data, ref uint size);
+    [DllImport("hid.dll")]
+    public static extern int HidP_GetUsageValue(int reportType, ushort usagePage, ushort linkCollection,
+        ushort usage, out uint value, byte[] preparsed, byte[] report, uint reportLength);
     public const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOZORDER = 0x4, SWP_NOREDRAW = 0x8, SWP_NOACTIVATE = 0x10;
     public const uint SWP_NOSENDCHANGING = 0x400;
     public const uint SMTO_ABORTIFHUNG = 0x2;
@@ -76,6 +103,11 @@ internal static class Native
         public uint dwFlags;
     }
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string? cls, string? title);
+    [DllImport("gdi32.dll")] public static extern IntPtr CreateRectRgn(int l, int t, int r, int b);
+    [DllImport("user32.dll")] public static extern int SetWindowRgn(IntPtr hWnd, IntPtr rgn, bool redraw);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint attach, uint attachTo, bool on);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);

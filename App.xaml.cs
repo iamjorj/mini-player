@@ -108,6 +108,11 @@ public partial class App : Application
         _pip.Show();
     }
 
+    /// <summary>Trace on: MINIPLAYER_TRACE=1, or a MiniPlayer.trace marker file in %TEMP%.</summary>
+    internal static readonly bool Trace =
+        Environment.GetEnvironmentVariable("MINIPLAYER_TRACE") == "1"
+        || System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "MiniPlayer.trace"));
+
     /// <summary>Append a line to %TEMP%\MiniPlayer.log (for diagnosing problems).</summary>
     internal static void Log(string message)
     {

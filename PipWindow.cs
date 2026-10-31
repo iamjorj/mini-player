@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Threading;
@@ -42,6 +43,43 @@ public sealed class PipWindow
         Source = source;
         _watch = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(400) };
         _watch.Tick += (_, _) => WatchSource();
+        _tame = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+        _tame.Tick += (_, _) =>
+        {
+            TameFullscreen(handOffFocus: false);
+            if (Environment.TickCount64 > _tameUntil)
+                _tame.Stop();
+        };
+        _click = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(60) };
+        _click.Tick += (_, _) => FlushPendingClick();
+    }
+
+    // After a click is posted to a fullscreen source, the app takes focus on its own a moment
+    // later, and the shell starts dimming the screen for it (see TameFullscreen). Chasing it
+    // at 50ms for half a second removes the dim before its fade-in becomes visible.
+    private readonly DispatcherTimer _tame;
+    private long _tameUntil;
+
+    // A fullscreen player's control bar reacts to hover on its animation frames: a click in
+    // the same instant as its hover lands on a bar that is not interactive yet and falls
+    // through to the video (pausing it). Give the page one beat between the two.
+    private readonly DispatcherTimer _click;
+    private int _clickX, _clickY;
+
+    private void FlushPendingClick()
+    {
+        _click.Stop();
+        if (!Native.IsWindow(Source))
+            return;
+        PostToSource(WM_LBUTTONDOWN, new IntPtr(1) /* MK_LBUTTON */, _clickX, _clickY);
+        PostToSource(WM_LBUTTONUP, IntPtr.Zero, _clickX, _clickY);
+        StartTameBurst(); // the app may grab focus handling it; chase the shell dim
+    }
+
+    private void StartTameBurst()
+    {
+        _tameUntil = Environment.TickCount64 + 600;
+        _tame.Start();
     }
 
     public void Show()
@@ -136,14 +174,7 @@ public sealed class PipWindow
         _ghosted = true;
 
         // Hand keyboard focus to the next real window so you can keep working.
-        for (IntPtr w = Native.GetTopWindow(IntPtr.Zero); w != IntPtr.Zero; w = Native.GetWindow(w, Native.GW_HWNDNEXT))
-        {
-            if (w != Source && !Native.IsIconic(w) && App.CanPopOut(w))
-            {
-                Native.SetForegroundWindow(w);
-                break;
-            }
-        }
+        FocusNext(Source);
     }
 
     /// <summary>Put the real window back exactly as it was.</summary>
@@ -160,6 +191,122 @@ public sealed class PipWindow
         RestoreStyle(Source, _sourceExStyle);
         if (_sourceHadAlpha)
             Native.SetLayeredWindowAttributes(Source, _sourceColorKey, _sourceAlpha, _sourceLayerFlags);
+    }
+
+    /// <summary>
+    /// Keep the ghost really invisible. The app can strip the ghosting behind our back —
+    /// Chrome restores its own saved window styles when a video leaves fullscreen, for one —
+    /// and a visible, mouse-eating ghost then sits over the screen. Also hide the app's own
+    /// little popup windows (link bubble, tooltips): they would pop up at the ghost's spot.
+    /// </summary>
+    private void EnsureGhost()
+    {
+        if (!_ghosted || !Native.IsWindow(Source))
+            return;
+        int ex = Native.GetWindowLong(Source, Native.GWL_EXSTYLE);
+        if ((ex & Native.WS_EX_LAYERED) == 0
+            || !Native.GetLayeredWindowAttributes(Source, out _, out byte alpha, out uint flags)
+            || alpha != 1 || (flags & Native.LWA_ALPHA) == 0)
+        {
+            if (App.Trace)
+                App.Log($"EnsureGhost: re-ghosting, exstyle=0x{ex:X}");
+            Native.SetWindowLong(Source, Native.GWL_EXSTYLE, ex | Native.WS_EX_LAYERED);
+            Native.SetLayeredWindowAttributes(Source, 0, 1, Native.LWA_ALPHA);
+        }
+        ApplySourceInputStyle(); // heal a stripped click-through style too
+
+        // Track fullscreen here too, not only while interacting, so the state is right
+        // even while the player is asleep.
+        Native.GetClientRect(Source, out var client);
+        bool pinned = IsPinnedFullscreen(client);
+        if (pinned != _srcPinned)
+        {
+            _srcPinned = pinned;
+            if (pinned)
+            {
+                _fsMovable = true; // optimistic; AlignSourceUnder demotes if it fights back
+                _fsFights = 0;
+                TameFullscreen(handOffFocus: true); // went fullscreen while asleep
+                StartTameBurst();
+            }
+            if (_interactive)
+                ApplySourceInputStyle();
+        }
+        else if (pinned)
+            TameFullscreen(handOffFocus: false);
+
+        HideOwnedPopups();
+    }
+
+    /// <summary>
+    /// Hide the app's own little popup windows (link bubble, tooltips, the "press Esc to
+    /// exit full screen" toast): they would pop up at the invisible window's position.
+    /// </summary>
+    private void HideOwnedPopups()
+    {
+        Native.EnumWindows((w, _) =>
+        {
+            if (Native.IsWindowVisible(w) && Native.GetWindow(w, Native.GW_OWNER) == Source
+                && Native.ClassName(w) is not ("IME" or "MSCTFIME UI")) // input-method UI stays
+                Native.ShowWindow(w, Native.SW_HIDE);
+            return true;
+        }, IntPtr.Zero);
+    }
+
+    /// <summary>
+    /// The (invisible) window going fullscreen makes Windows treat it as the active
+    /// fullscreen app: the shell dims the rest of the screen (a Shell_SystemDim window).
+    /// Normally the app itself covers that dim — ours is invisible, so the user sees a dark
+    /// veil that also swallows their clicks, and it fully covers the app, whose renderer
+    /// then pauses (so hover looks dead too). Hide the dim, and hand the foreground to a
+    /// real window so the shell stops treating the ghost as the active fullscreen app.
+    /// </summary>
+    private IntPtr _dimNeutered; // the dim window already given an empty region
+
+    private void TameFullscreen(bool handOffFocus)
+    {
+        IntPtr dim = Native.FindWindow("Shell_SystemDim", null);
+        if (dim != IntPtr.Zero && dim != _dimNeutered)
+        {
+            // An empty window region beats hiding: it sticks even when the shell shows the
+            // window again, leaving nothing to draw and nothing to swallow the mouse.
+            Native.SetWindowRgn(dim, Native.CreateRectRgn(0, 0, 0, 0), false);
+            Native.ShowWindow(dim, Native.SW_HIDE);
+            _dimNeutered = dim;
+            if (App.Trace)
+                App.Log($"TameFullscreen: neutered the shell dim 0x{dim:X}");
+        }
+        HideOwnedPopups(); // the Esc-toast and friends reappear whenever the app regains focus
+
+        // Hand the foreground away only ONCE, at the fullscreen transition. Retrying turns
+        // into a focus war with the app (it may take focus right back), and every round
+        // makes the shell reconsider its fullscreen treatment — flicker, not calm.
+        if (handOffFocus && Native.GetForegroundWindow() == Source)
+        {
+            if (App.Trace)
+                App.Log("TameFullscreen: ghost is foreground, handing focus away");
+            FocusNext(Source);
+        }
+    }
+
+    /// <summary>Hand keyboard focus to the top real window other than <paramref name="avoid"/>.</summary>
+    private static void FocusNext(IntPtr avoid)
+    {
+        for (IntPtr w = Native.GetTopWindow(IntPtr.Zero); w != IntPtr.Zero; w = Native.GetWindow(w, Native.GW_HWNDNEXT))
+        {
+            if (w != avoid && !Native.IsIconic(w) && App.CanPopOut(w))
+            {
+                // A background process may not reassign the foreground; attaching to the
+                // current foreground thread's input queue is the sanctioned way around it.
+                uint fgThread = Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out _);
+                uint me = Native.GetCurrentThreadId();
+                bool attached = fgThread != 0 && fgThread != me && Native.AttachThreadInput(me, fgThread, true);
+                Native.SetForegroundWindow(w);
+                if (attached)
+                    Native.AttachThreadInput(me, fgThread, false);
+                break;
+            }
+        }
     }
 
     private const string GhostTag = "MiniPlayer.Ghosted";
@@ -232,6 +379,8 @@ public sealed class PipWindow
             return;
         }
 
+        EnsureGhost();
+
         // Safety net in case the mouse hook missed the cursor leaving. While interacting, also
         // re-read the geometry: the source can resize itself behind our back (a video going
         // fullscreen resizes the whole browser), and stale numbers put clicks on the wrong spot.
@@ -240,11 +389,30 @@ public sealed class PipWindow
             if (!IsOverVideo(cursor))
                 ExitInteract($"watch cursor={cursor.X},{cursor.Y}");
             else if (_lPhase == 0 && _rPhase == 0 && Environment.TickCount64 - _lastMoveTick > IdleSleepMs)
-                ExitInteract("idle"); // a resting cursor hands pinch and wheel back to the player
+                ExitInteract("idle"); // long abandoned; a starting pinch is seen on the touchpad itself
             else
             {
                 RefreshInteractGeometry();
-                AlignSourceUnder(cursor.X, cursor.Y, async: true);
+                if (_srcPinned && !_fsMovable)
+                    KeepHoverAlive(cursor);
+                else
+                {
+                    // With the cursor at rest, the window should sit where alignment put it.
+                    // A fullscreen window found far away keeps snapping back (its app pins
+                    // it): after a few strikes, stop fighting and switch to posted hover.
+                    if (_srcPinned && _lastAlignX != int.MinValue
+                        && Environment.TickCount64 - _lastMoveTick > 300
+                        && (Math.Abs(_srcOriginX - _frameOffsetX - _lastAlignX) > 64
+                            || Math.Abs(_srcOriginY - _frameOffsetY - _lastAlignY) > 64)
+                        && ++_fsFights >= 3)
+                    {
+                        _fsMovable = false;
+                        ApplySourceInputStyle();
+                        if (App.Trace)
+                            App.Log("WatchSource: fullscreen window keeps snapping back; posted hover");
+                    }
+                    AlignSourceUnder(cursor.X, cursor.Y, async: true);
+                }
             }
         }
 
@@ -370,6 +538,10 @@ public sealed class PipWindow
                     return IntPtr.Zero;
                 break;
 
+            case Native.WM_INPUT:
+                OnRawInput(lParam);
+                break; // falls through to DefWindowProc, which WM_INPUT requires for cleanup
+
             case Native.WM_SIZING:
                 SmoothZoom.KeepAspectWhileResizing(wParam, lParam, _aspect);
                 return new IntPtr(1);
@@ -479,8 +651,15 @@ public sealed class PipWindow
     private int _sleepX = int.MinValue, _sleepY; // where the cursor was when interaction ended
     private long _lastAlignTick;             // when the source was last moved (rate cap)
     private int _srcOriginX, _srcOriginY;    // where the source's client area starts on screen
-    private bool _srcPinned;                 // fullscreen source: Windows/Chrome pin it, it cannot be moved
-    private const int IdleSleepMs = 600, DragThresholdPx = 6;
+    private bool _srcPinned;                 // fullscreen source: monitor-sized, clicks are posted to it
+    private bool _fsMovable = true;          // fullscreen source still accepts alignment moves (real hover)
+    private int _fsFights;                   // times the fullscreen window snapped back against alignment
+    private bool _fingersDown;               // two+ fingers on the touchpad: the gesture is the player's
+    private long _lastClickTick;             // when a click was last played into the app
+    private int _hoverJitter;                // alternates posted hovers by 1px (see KeepHoverAlive)
+    private byte[]? _rawBuf, _reportBuf;     // reused raw-input buffers
+    private readonly Dictionary<IntPtr, byte[]?> _touchpads = new(); // device -> HID preparsed data
+    private const int IdleSleepMs = 60_000, ControlsLingerMs = 2500, DragThresholdPx = 6;
 
     private bool EnterInteract()
     {
@@ -496,15 +675,16 @@ public sealed class PipWindow
         _lPhase = _rPhase = 0;
 
         _interactive = true;
-        Native.SetWindowLong(Source, Native.GWL_EXSTYLE,
-            Native.GetWindowLong(Source, Native.GWL_EXSTYLE) & ~Native.WS_EX_TRANSPARENT);
+        _fingersDown = false;
+        ApplySourceInputStyle();
         AlignSourceUnder(p.X, p.Y, async: false);
         Native.SetWindowPos(Source, Native.HWND_TOPMOST, 0, 0, 0, 0, // above the mini player
             Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+        SetTouchpadWatch(true);
 
         _hookProc ??= OnGlobalMouse;
         _mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _hookProc, Native.GetModuleHandle(null), 0);
-        if (Environment.GetEnvironmentVariable("MINIPLAYER_TRACE") == "1")
+        if (App.Trace)
             App.Log($"EnterInteract: cursor={p.X},{p.Y} video={_videoScreen.Left},{_videoScreen.Top}-{_videoScreen.Right},{_videoScreen.Bottom}");
         return true;
     }
@@ -515,9 +695,11 @@ public sealed class PipWindow
     {
         if (!_interactive)
             return;
-        if (Environment.GetEnvironmentVariable("MINIPLAYER_TRACE") == "1")
+        if (App.Trace)
             App.Log($"ExitInteract: {reason}");
         _interactive = false;
+        _fingersDown = false;
+        SetTouchpadWatch(false);
         _lPhase = _rPhase = 0;
         if (Native.GetCursorPos(out var sleep)) // wake again only once the cursor moves from here
         {
@@ -564,12 +746,139 @@ public sealed class PipWindow
         _srcOriginY = origin.Y;
         _videoScreen = VideoScreenRect();
 
-        // A window in real fullscreen (a video, a game) is pinned to its screen: Windows and the
-        // app itself snap it back when moved, so lining it up under the cursor is impossible.
-        // Clicks then warp the cursor to the matching screen point instead (see InjectClick).
+        // A window in real fullscreen (a video, a game) keeps its monitor size, and clicks go
+        // to it POSTED (position-proof, no focus steal). Hover stays REAL — most fullscreen
+        // windows can still be lined up under the cursor — unless this one keeps snapping
+        // back, in which case AlignSourceUnder switches this session to posted hover.
+        bool pinned = IsPinnedFullscreen(client);
+        if (pinned != _srcPinned)
+        {
+            _srcPinned = pinned;
+            if (pinned)
+            {
+                _fsMovable = true; // optimistic; AlignSourceUnder demotes if it fights back
+                _fsFights = 0;
+                TameFullscreen(handOffFocus: true); // once, right at the transition
+                StartTameBurst(); // and keep chasing the dim through it
+            }
+            if (_interactive) // a video went fullscreen (or left it) mid-session
+                ApplySourceInputStyle();
+        }
+    }
+
+    /// <summary>
+    /// While awake the app takes the real mouse, so hovering is native (enter/leave, cursors,
+    /// control bars all behave as if you were in the app). Exceptions go click-through: a
+    /// fullscreen window that refuses to be lined up under the cursor (driven by posted input
+    /// instead), and the moment two fingers land on the touchpad, so the starting pinch
+    /// hit-tests to the player underneath and resizes it rather than zooming the page.
+    /// </summary>
+    private void ApplySourceInputStyle()
+    {
+        int ex = Native.GetWindowLong(Source, Native.GWL_EXSTYLE);
+        bool transparent = !_interactive || (_srcPinned && !_fsMovable) || _fingersDown;
+        int want = transparent ? ex | Native.WS_EX_TRANSPARENT : ex & ~Native.WS_EX_TRANSPARENT;
+        if (want != ex)
+            Native.SetWindowLong(Source, Native.GWL_EXSTYLE, want);
+    }
+
+    /// <summary>
+    /// Listen to the precision touchpad itself (raw HID) while interacting: contact count is
+    /// the only signal that arrives when fingers land, before Windows picks which window gets
+    /// the gesture — no timer can route a pinch correctly AND leave hovering alone.
+    /// </summary>
+    private void SetTouchpadWatch(bool on)
+    {
+        var rid = new Native.RAWINPUTDEVICE
+        {
+            usUsagePage = 0x0D, // digitizers
+            usUsage = 0x05,     // precision touchpad
+            dwFlags = on ? Native.RIDEV_INPUTSINK : Native.RIDEV_REMOVE,
+            hwndTarget = on ? _hwnd : IntPtr.Zero,
+        };
+        Native.RegisterRawInputDevices(ref rid, 1, (uint)Marshal.SizeOf<Native.RAWINPUTDEVICE>());
+    }
+
+    private void OnRawInput(IntPtr lParam)
+    {
+        if (!_interactive)
+            return;
+        uint size = 0;
+        Native.GetRawInputData(lParam, Native.RID_INPUT, null, ref size, Native.RawHeaderSize);
+        if (size == 0 || size > 65536)
+            return;
+        if (_rawBuf == null || _rawBuf.Length < size)
+            _rawBuf = new byte[size];
+        uint got = size;
+        if (Native.GetRawInputData(lParam, Native.RID_INPUT, _rawBuf, ref got, Native.RawHeaderSize) != size)
+            return;
+        if (BitConverter.ToInt32(_rawBuf, 0) != Native.RIM_TYPEHID)
+            return;
+        byte[]? prep = PreparsedFor((IntPtr)BitConverter.ToInt64(_rawBuf, 8));
+        if (prep == null)
+            return;
+        int sizeHid = BitConverter.ToInt32(_rawBuf, 24); // RAWHID after the 24-byte header
+        int reports = BitConverter.ToInt32(_rawBuf, 28);
+        if (sizeHid <= 0 || reports <= 0 || 32 + (long)sizeHid * reports > _rawBuf.Length)
+            return;
+        if (_reportBuf == null || _reportBuf.Length < sizeHid)
+            _reportBuf = new byte[sizeHid];
+        for (int i = 0; i < reports; i++)
+        {
+            Array.Copy(_rawBuf, 32 + (long)i * sizeHid, _reportBuf, 0, sizeHid);
+            if (Native.HidP_GetUsageValue(0 /* input */, 0x0D, 0, 0x54 /* contact count */,
+                    out uint contacts, prep, _reportBuf, (uint)sizeHid) == Native.HIDP_STATUS_SUCCESS)
+                OnTouchpadContacts((int)contacts);
+        }
+    }
+
+    private byte[]? PreparsedFor(IntPtr device)
+    {
+        if (_touchpads.TryGetValue(device, out var cached))
+            return cached;
+        uint size = 0;
+        Native.GetRawInputDeviceInfo(device, Native.RIDI_PREPARSEDDATA, null, ref size);
+        byte[]? data = null;
+        if (size > 0)
+        {
+            data = new byte[size];
+            if (Native.GetRawInputDeviceInfo(device, Native.RIDI_PREPARSEDDATA, data, ref size) <= 0)
+                data = null;
+        }
+        _touchpads[device] = data;
+        return data;
+    }
+
+    private void OnTouchpadContacts(int contacts)
+    {
+        if (contacts >= 2 && !_fingersDown)
+        {
+            // Two fingers landed while hovering: a pinch (or two-finger gesture) is starting.
+            // Step out of its way now, before Windows picks its target window.
+            if (Native.GetCursorPos(out var p) && IsOverVideo(p))
+            {
+                _fingersDown = true;
+                ApplySourceInputStyle();
+            }
+        }
+        else if (contacts < 2 && _fingersDown)
+        {
+            _fingersDown = false; // fingers lifted: hover is the app's again
+            ApplySourceInputStyle();
+        }
+    }
+
+    /// <summary>
+    /// Is the source a fullscreen window pinned to its monitor? With a tolerance: at some DPI
+    /// scales a fullscreen window's client comes out a pixel or two SHORT of the monitor
+    /// (seen live: 2880x1799 on a 2880x1800 screen). Missing it means treating a fullscreen
+    /// window as movable — a losing fight that throws it around and misplaces every click.
+    /// </summary>
+    private bool IsPinnedFullscreen(Native.RECT client)
+    {
         var mi = new Native.MONITORINFO { cbSize = Marshal.SizeOf<Native.MONITORINFO>() };
         Native.GetMonitorInfo(Native.MonitorFromWindow(Source, 2 /* nearest */), ref mi);
-        _srcPinned = client.Width >= mi.rcMonitor.Width && client.Height >= mi.rcMonitor.Height;
+        return client.Width >= mi.rcMonitor.Width - 4 && client.Height >= mi.rcMonitor.Height - 4;
     }
 
     /// <summary>The video area in screen coordinates, shrunk by the resize border.</summary>
@@ -597,17 +906,20 @@ public sealed class PipWindow
     /// <summary>Move the (invisible) real window so the point shown under the cursor is really under it.</summary>
     private void AlignSourceUnder(int px, int py, bool async)
     {
-        if (_srcPinned)
-            return; // fullscreen: it cannot be moved, and it already covers the cursor anyway
+        if (_srcPinned && !_fsMovable)
+            return; // this fullscreen window snaps back when moved; posted hover handles it
 
         double u = (px - _pipLeft - _videoArea.Left) / (double)_videoArea.Width;
         double v = (py - _pipTop - _videoArea.Top) / (double)_videoArea.Height;
         int x = (int)Math.Round(px - u * _srcClientW) - _frameOffsetX;
         int y = (int)Math.Round(py - v * _srcClientH) - _frameOffsetY;
 
-        // Moving a big window is what costs, so skip moves that change nothing visible.
-        // Near the app's real size that is almost all of them.
-        if (Math.Abs(x - _lastAlignX) <= 1 && Math.Abs(y - _lastAlignY) <= 1)
+        // Moving a big window is what costs, so skip moves that change nothing visible —
+        // unless a fullscreen window's own app snapped it back and it needs re-aligning.
+        bool displaced = _srcPinned && _lastAlignX != int.MinValue
+            && (Math.Abs(_srcOriginX - _frameOffsetX - _lastAlignX) > 64
+                || Math.Abs(_srcOriginY - _frameOffsetY - _lastAlignY) > 64);
+        if (!displaced && Math.Abs(x - _lastAlignX) <= 1 && Math.Abs(y - _lastAlignY) <= 1)
             return;
 
         // Cap the rate too: a fast mouse must never queue up more moves than the app can
@@ -730,7 +1042,50 @@ public sealed class PipWindow
         if (_lPhase == 1 || _rPhase == 1)
             return; // button held but no drag yet: hold everything still
         RefreshInteractGeometry(); // a handful of cheap reads, and the hook stays tiny
-        AlignSourceUnder(_hookX, _hookY, async: true);
+        if (_srcPinned && !_fsMovable)
+            PostToSource(Native.WM_MOUSEMOVE, IntPtr.Zero, _hookX, _hookY); // hover the point the pip shows
+        else
+            AlignSourceUnder(_hookX, _hookY, async: true);
+    }
+
+    /// <summary>
+    /// A pinned (fullscreen) source only hears the hovers the player posts, and Windows follows
+    /// each with a mouse-leave (the real cursor is on the pip). Fullscreen players ignore the
+    /// leave — the pointer "cannot" leave a fullscreen window — but their idle timers still run,
+    /// so around the control bar, or right after a click, keep re-posting the hover (nudged 1px
+    /// so the app does not drop repeats) until <see cref="ControlsLingerMs"/> passes.
+    /// </summary>
+    private void KeepHoverAlive(Native.POINT cursor)
+    {
+        long now = Environment.TickCount64;
+        bool overControls = cursor.Y >= _videoScreen.Top + (_videoScreen.Bottom - _videoScreen.Top) * 3 / 4;
+        if (now - _lastClickTick < ControlsLingerMs
+            || (overControls && now - _lastMoveTick < ControlsLingerMs))
+        {
+            _hoverJitter ^= 1;
+            PostToSource(Native.WM_MOUSEMOVE, IntPtr.Zero, cursor.X + _hoverJitter, cursor.Y);
+        }
+    }
+
+    /// <summary>Post a mouse message to the app at the point the pip shows under (px,py).</summary>
+    private void PostToSource(int msg, IntPtr wParam, int px, int py)
+    {
+        double u = Math.Clamp((px - _pipLeft - _videoArea.Left) / (double)_videoArea.Width, 0, 1);
+        double v = Math.Clamp((py - _pipTop - _videoArea.Top) / (double)_videoArea.Height, 0, 1);
+        var pt = new Native.POINT
+        {
+            X = _srcOriginX + (int)Math.Round(u * _srcClientW),
+            Y = _srcOriginY + (int)Math.Round(v * _srcClientH),
+        };
+        IntPtr target = InputChild(Source);
+        Native.ScreenToClient(target, ref pt);
+        if (msg == WM_LBUTTONDOWN && App.Trace)
+        {
+            Native.GetWindowRect(target, out var tr);
+            App.Log($"PostClick: client={pt.X},{pt.Y} u={u:F3} v={v:F3} target=0x{target:X} {tr.Width}x{tr.Height}"
+                + $" vis={Native.IsWindowVisible(target)} srcVis={Native.IsWindowVisible(Source)} fg={Native.GetForegroundWindow() == Source}");
+        }
+        Native.PostMessage(target, msg, wParam, new IntPtr((pt.Y << 16) | (pt.X & 0xFFFF)));
     }
 
     /// <summary>Play the click the hook ate back into the app, at the point the user sees.</summary>
@@ -738,28 +1093,24 @@ public sealed class PipWindow
     {
         if (!_interactive)
             return;
+        _lastClickTick = Environment.TickCount64;
         RefreshInteractGeometry();
         Native.GetCursorPos(out var p);
-        if (Environment.GetEnvironmentVariable("MINIPLAYER_TRACE") == "1")
+        if (App.Trace)
             App.Log($"InjectClick: cursor={p.X},{p.Y} pinned={_srcPinned} src={_srcOriginX},{_srcOriginY} {_srcClientW}x{_srcClientH}");
         if (_srcPinned)
         {
             // Fullscreen source: it cannot be lined up under the cursor, and warping the cursor
             // to the point flashes a second pointer. Hand the click to the window directly.
-            double u = Math.Clamp((p.X - _pipLeft - _videoArea.Left) / (double)_videoArea.Width, 0, 1);
-            double v = Math.Clamp((p.Y - _pipTop - _videoArea.Top) / (double)_videoArea.Height, 0, 1);
-            var pt = new Native.POINT
-            {
-                X = _srcOriginX + (int)Math.Round(u * _srcClientW),
-                Y = _srcOriginY + (int)Math.Round(v * _srcClientH),
-            };
-            IntPtr target = InputChild(Source);
-            Native.ScreenToClient(target, ref pt);
-            IntPtr pos = new((pt.Y << 16) | (pt.X & 0xFFFF));
-            Native.PostMessage(target, Native.WM_MOUSEMOVE, IntPtr.Zero, pos);
-            Native.PostMessage(target, WM_LBUTTONDOWN, new IntPtr(1) /* MK_LBUTTON */, pos);
-            Native.PostMessage(target, WM_LBUTTONUP, IntPtr.Zero, pos);
-            Native.SetForegroundWindow(Source); // a real click would focus the app too (Esc, typing)
+            // Hover first; the press follows one beat later (see FlushPendingClick). No
+            // SetForegroundWindow: focusing the invisible fullscreen window makes the shell
+            // dim the screen for it (see TameFullscreen). Posted clicks need no focus.
+            if (_click.IsEnabled)
+                FlushPendingClick(); // a fast double-click: deliver the first press now
+            PostToSource(Native.WM_MOUSEMOVE, IntPtr.Zero, p.X, p.Y);
+            _clickX = p.X;
+            _clickY = p.Y;
+            _click.Start();
             return;
         }
         AlignSourceUnder(p.X, p.Y, async: false);
@@ -770,18 +1121,30 @@ public sealed class PipWindow
         Native.mouse_event(Native.MOUSEEVENTF_LEFTUP, 0, 0, 0, InjectTag);
     }
 
-    /// <summary>The child window that takes a browser's input (web content), or the window itself.</summary>
+    /// <summary>
+    /// The child window that takes a browser's input, or the window itself. A browser window
+    /// holds one web-content widget PER TAB plus stubs, and fullscreen video adds its own:
+    /// posting to a hidden tab's widget goes to a renderer that is not on screen and the input
+    /// is lost — so prefer the visible widget, and the largest when several qualify.
+    /// </summary>
     private static IntPtr InputChild(IntPtr window)
     {
-        IntPtr found = window;
+        IntPtr best = window;
+        long bestScore = -1;
         Native.EnumChildWindows(window, (child, _) =>
         {
             if (Native.ClassName(child) != "Chrome_RenderWidgetHostHWND")
                 return true;
-            found = child;
-            return false;
+            Native.GetWindowRect(child, out var r);
+            long score = (long)r.Width * r.Height + (Native.IsWindowVisible(child) ? long.MaxValue / 2 : 0);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = child;
+            }
+            return true;
         }, IntPtr.Zero);
-        return found;
+        return best;
     }
 
     /// <summary>A click outside the video: step out of the way first, then let the click happen.</summary>
