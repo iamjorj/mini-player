@@ -29,7 +29,7 @@ Browsers have picture-in-picture for videos. Mini Player does it for every windo
 | **Put it back** | Press <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>P</kbd> again |
 | **Resize** | Pinch on the touchpad, scroll the mouse wheel, or drag an edge |
 | **Move** | Drag the mini player |
-| **Use the app** | Click it: pause, skip, scroll, type, it all goes to the real app |
+| **Use the app** | Just point at it: the app reacts to your hover (video controls appear), clicks hit exactly what you see, and typing goes to the app |
 | **More options** | Right-click: *Back to app* or *Close mini player* |
 
 The mini player starts in the bottom-right corner and keeps the window's shape. Mini Player lives in the system tray; right-click the tray icon to exit.
@@ -76,7 +76,7 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 - **Live picture:** the mini player shows the window through a DWM thumbnail, the same live preview Windows uses for taskbar hovers. No screen capture, so it's cheap and sharp.
 - **Video keeps playing:** Chrome and Edge pause drawing when a window is covered. Mini Player keeps the original window on top but fully transparent, so the browser never thinks it's hidden.
 - **Smooth pinch:** touchpad gestures come straight from Windows DirectManipulation, and each resize is synced to the screen's refresh rate.
-- **Click-through:** when you click the mini player, the invisible original is lined up under your cursor, so clicks and typing land in the right place.
+- **Click-through:** when you point at the mini player, the invisible original is lined up under your cursor, so hovering, clicks and typing land in the right place. Once the cursor rests for a moment, the player takes the mouse back for pinch and wheel resizing.
 
 Written in C# with WPF and plain Win32.
 

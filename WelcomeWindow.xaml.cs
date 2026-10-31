@@ -98,15 +98,20 @@ public partial class WelcomeWindow : Window
             Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
         _zoom!.Target = _hwnd;
 
-        // Swap back once WPF has drawn the new size (a few frames to be safe; the picture is identical).
+        // Swap back only once the redraw is provably on screen. A blind frame count isn't enough:
+        // on a big window, layout alone can take longer than the wait, and the swap then showed a
+        // half-drawn frame. So finish layout now, let WPF draw a few frames at the final size,
+        // and wait for Windows to actually put them on screen.
+        UpdateLayout();
         int generation = _zoomGeneration, frames = 0;
         void OnRendered(object? s, EventArgs e)
         {
-            if (++frames < 4)
+            if (++frames < 3)
                 return;
             System.Windows.Media.CompositionTarget.Rendering -= OnRendered;
             if (generation != _zoomGeneration || _proxy == null)
                 return; // a new zoom started meanwhile
+            Native.DwmFlush(); // returns after the next screen update is composed
             _proxy.Dispose();
             _proxy = null;
         }

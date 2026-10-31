@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Threading;
 
 namespace MiniPlayer;
@@ -231,20 +232,54 @@ public sealed class PipWindow
             return;
         }
 
-        // Safety net in case the mouse hook missed the cursor leaving.
-        if (_interactive && Native.GetCursorPos(out var cursor) && !IsOverVideo(cursor))
-            ExitInteract();
+        // Safety net in case the mouse hook missed the cursor leaving. While interacting, also
+        // re-read the geometry: the source can resize itself behind our back (a video going
+        // fullscreen resizes the whole browser), and stale numbers put clicks on the wrong spot.
+        if (_interactive && Native.GetCursorPos(out var cursor))
+        {
+            if (!IsOverVideo(cursor))
+                ExitInteract($"watch cursor={cursor.X},{cursor.Y}");
+            else if (_lPhase == 0 && _rPhase == 0 && Environment.TickCount64 - _lastMoveTick > IdleSleepMs)
+                ExitInteract("idle"); // a resting cursor hands pinch and wheel back to the player
+            else
+            {
+                RefreshInteractGeometry();
+                AlignSourceUnder(cursor.X, cursor.Y, async: true);
+            }
+        }
 
         // Minimized (e.g. via the taskbar)? Un-minimize it, still invisible, so the preview stays live.
         if (Native.IsIconic(Source))
             Native.ShowWindow(Source, Native.SW_SHOWNOACTIVATE);
 
-        // Source window resized: refit the preview.
+        // Source window changed shape (e.g. a video went fullscreen): reshape the mini player to
+        // match, so the picture fills it again instead of leaving black bars at the sides.
         if (SourceAspect() is double a && Math.Abs(a - _aspect) > 0.01)
         {
             _aspect = a;
-            UpdateThumbnail();
+            ResizeToAspect();
         }
+    }
+
+    /// <summary>Resize to the current aspect ratio, keeping the center and staying in the work area.</summary>
+    private void ResizeToAspect()
+    {
+        Native.GetWindowRect(_hwnd, out var r);
+        var work = Native.WorkAreaFor(_hwnd);
+        int w = r.Width, h = (int)Math.Round(w / _aspect);
+        if (h > work.Height)
+        {
+            h = work.Height;
+            w = (int)Math.Round(h * _aspect);
+        }
+        if (w > work.Width)
+        {
+            w = work.Width;
+            h = (int)Math.Round(w / _aspect);
+        }
+        int x = Math.Clamp(r.Left + (r.Width - w) / 2, work.Left, Math.Max(work.Left, work.Right - w));
+        int y = Math.Clamp(r.Top + (r.Height - h) / 2, work.Top, Math.Max(work.Top, work.Bottom - h));
+        Native.SetWindowPos(_hwnd, IntPtr.Zero, x, y, w, h, Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
     }
 
     /// <summary>Close the mini player and give the real window back (and focus it, unless told not to).</summary>
@@ -302,8 +337,19 @@ public sealed class PipWindow
             case WM_MOUSEACTIVATE:
                 return new IntPtr(MA_NOACTIVATE); // clicking the player doesn't steal focus from your work
 
+            case Native.WM_MOUSEMOVE:
+                // Just pointing at the player wakes it: hovering then reaches the real app
+                // (video controls appear). Not during a pinch/zoom, which must stay ours, and
+                // only if the cursor really moved: raising a window under a resting cursor makes
+                // Windows synthesize a mouse move, which must not wake us right back up.
+                if (!_interactive && _zoom?.Active != true && Native.GetCursorPos(out var moved)
+                    && (Math.Abs(moved.X - _sleepX) > 1 || Math.Abs(moved.Y - _sleepY) > 1))
+                    EnterInteract();
+                break;
+
             case WM_LBUTTONDOWN:
-                // Press and drag = move the player. Plain click = hand it to the app.
+                // Only reached while asleep (the hook owns clicks while awake): a click after the
+                // cursor sat still. Press-and-drag moves the player; a plain click goes to the app.
                 Native.GetCursorPos(out var down);
                 if (Native.DragDetect(hwnd, down))
                 {
@@ -311,11 +357,7 @@ public sealed class PipWindow
                     Native.SendMessage(hwnd, Native.WM_NCLBUTTONDOWN, new IntPtr(Native.HTCAPTION), IntPtr.Zero);
                 }
                 else if (EnterInteract())
-                {
-                    // Replay the click; the real window is now exactly under the cursor.
-                    Native.mouse_event(Native.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
-                    Native.mouse_event(Native.MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
-                }
+                    InjectClick();
                 return IntPtr.Zero;
 
             case WM_RBUTTONUP:
@@ -334,6 +376,8 @@ public sealed class PipWindow
 
             case Native.WM_SIZE:
                 UpdateThumbnail();
+                if (_interactive)
+                    RefreshInteractGeometry(); // keep the hook's cached rects honest
                 break;
 
             case WM_GETMINMAXINFO:
@@ -400,11 +444,15 @@ public sealed class PipWindow
     }
 
     // ---- Interacting with the real app ----
-    // The real window sits invisible on top. To interact, we line it up so the point you see under the
-    // cursor in the mini player is the same point of the real window under the cursor, and turn off
-    // click-through. Real clicks, hovering, scrolling and typing then go straight to the app.
-    // While interacting, a low-level mouse hook keeps it lined up as the cursor moves,
-    // and ends interaction when the cursor leaves the video.
+    // The real window sits invisible on top. Pointing at the video lines it up so the point you see
+    // under the cursor is the same point of the real window under the cursor, and turns off
+    // click-through: hovering, clicks and typing then go straight to the app, no click needed first.
+    // While interacting, a low-level mouse hook keeps it lined up as the cursor moves, and also keeps
+    // the player's own gestures working the same as ever: it takes the buttons and the wheel for
+    // itself (drag moves the player, wheel resizes, right-click opens the menu) and plays a plain
+    // click back into the app, so a click still hits exactly what you see. Interaction ends when the
+    // cursor leaves the video or sits still for a moment — that is what gives the touchpad pinch
+    // back to the player, since pinches start from a resting cursor.
 
     private Native.RECT _videoArea;          // where the preview is drawn, in mini player coordinates
     private bool _interactive;
@@ -414,6 +462,26 @@ public sealed class PipWindow
     private IntPtr _mouseHook;
     private Native.HookProc? _hookProc;
 
+    // Geometry cached for the mouse hook. The hook runs for every mouse event on the whole PC,
+    // so it must stay tiny: no system calls, no window moves. It only remembers the cursor and
+    // pokes the UI thread, which does the real work once per batch of events.
+    private Native.RECT _videoScreen;        // the video area in screen coordinates
+    private int _pipLeft, _pipTop;
+    private int _srcClientW, _srcClientH;
+    private int _lastAlignX = int.MinValue, _lastAlignY;
+    private int _alignQueued;                // 1 while an alignment is waiting on the UI thread
+    private int _hookX, _hookY;              // latest cursor position the hook saw
+    private long _lastMoveTick;              // when the cursor last moved (for falling asleep)
+    private int _lPhase;                     // left button: 0 up, 1 held (a click so far), 2 dragging the player
+    private int _rPhase;                     // right button: 0 up, 1 held (menu on release)
+    private int _downX, _downY;              // where the left button went down
+    private int _dragPipX, _dragPipY;        // where the player was when the drag started
+    private int _sleepX = int.MinValue, _sleepY; // where the cursor was when interaction ended
+    private long _lastAlignTick;             // when the source was last moved (rate cap)
+    private int _srcOriginX, _srcOriginY;    // where the source's client area starts on screen
+    private bool _srcPinned;                 // fullscreen source: Windows/Chrome pin it, it cannot be moved
+    private const int IdleSleepMs = 600, DragThresholdPx = 6;
+
     private bool EnterInteract()
     {
         if (_interactive)
@@ -422,29 +490,40 @@ public sealed class PipWindow
         if (!IsOverVideo(p))
             return false;
 
-        Native.GetWindowRect(Source, out var frame);
-        var origin = new Native.POINT();
-        Native.ClientToScreen(Source, ref origin);
-        _frameOffsetX = origin.X - frame.Left;
-        _frameOffsetY = origin.Y - frame.Top;
+        RefreshInteractGeometry();
+        _lastAlignX = int.MinValue;
+        _lastMoveTick = Environment.TickCount64;
+        _lPhase = _rPhase = 0;
 
         _interactive = true;
         Native.SetWindowLong(Source, Native.GWL_EXSTYLE,
             Native.GetWindowLong(Source, Native.GWL_EXSTYLE) & ~Native.WS_EX_TRANSPARENT);
-        AlignSourceUnder(p, async: false);
+        AlignSourceUnder(p.X, p.Y, async: false);
         Native.SetWindowPos(Source, Native.HWND_TOPMOST, 0, 0, 0, 0, // above the mini player
             Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
 
         _hookProc ??= OnGlobalMouse;
         _mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _hookProc, Native.GetModuleHandle(null), 0);
+        if (Environment.GetEnvironmentVariable("MINIPLAYER_TRACE") == "1")
+            App.Log($"EnterInteract: cursor={p.X},{p.Y} video={_videoScreen.Left},{_videoScreen.Top}-{_videoScreen.Right},{_videoScreen.Bottom}");
         return true;
     }
 
-    private void ExitInteract()
+    private void ExitInteract() => ExitInteract("direct");
+
+    private void ExitInteract(string reason)
     {
         if (!_interactive)
             return;
+        if (Environment.GetEnvironmentVariable("MINIPLAYER_TRACE") == "1")
+            App.Log($"ExitInteract: {reason}");
         _interactive = false;
+        _lPhase = _rPhase = 0;
+        if (Native.GetCursorPos(out var sleep)) // wake again only once the cursor moves from here
+        {
+            _sleepX = sleep.X;
+            _sleepY = sleep.Y;
+        }
         if (_mouseHook != IntPtr.Zero)
         {
             Native.UnhookWindowsHookEx(_mouseHook);
@@ -460,44 +539,272 @@ public sealed class PipWindow
                 Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
     }
 
+    /// <summary>
+    /// Re-read everything the alignment math uses. Cheap, and called often while interacting:
+    /// the source can move or resize at any time (a video going fullscreen resizes the whole
+    /// browser), and stale numbers would put hovers and clicks on the wrong spot.
+    /// </summary>
+    private void RefreshInteractGeometry()
+    {
+        Native.GetWindowRect(Source, out var frame);
+        var origin = new Native.POINT();
+        Native.ClientToScreen(Source, ref origin);
+        _frameOffsetX = origin.X - frame.Left;
+        _frameOffsetY = origin.Y - frame.Top;
+
+        Native.GetWindowRect(_hwnd, out var pip);
+        Native.GetClientRect(Source, out var client);
+        _pipLeft = pip.Left;
+        _pipTop = pip.Top;
+        if (client.Width != _srcClientW || client.Height != _srcClientH)
+            _lastAlignX = int.MinValue; // the source changed size: the last aligned spot means nothing now
+        _srcClientW = client.Width;
+        _srcClientH = client.Height;
+        _srcOriginX = origin.X;
+        _srcOriginY = origin.Y;
+        _videoScreen = VideoScreenRect();
+
+        // A window in real fullscreen (a video, a game) is pinned to its screen: Windows and the
+        // app itself snap it back when moved, so lining it up under the cursor is impossible.
+        // Clicks then warp the cursor to the matching screen point instead (see InjectClick).
+        var mi = new Native.MONITORINFO { cbSize = Marshal.SizeOf<Native.MONITORINFO>() };
+        Native.GetMonitorInfo(Native.MonitorFromWindow(Source, 2 /* nearest */), ref mi);
+        _srcPinned = client.Width >= mi.rcMonitor.Width && client.Height >= mi.rcMonitor.Height;
+    }
+
+    /// <summary>The video area in screen coordinates, shrunk by the resize border.</summary>
+    private Native.RECT VideoScreenRect()
+    {
+        Native.GetWindowRect(_hwnd, out var r);
+        int edge = (int)Math.Round(ResizeBorderDip * Native.GetDpiForWindow(_hwnd) / 96.0);
+        return new Native.RECT
+        {
+            Left = r.Left + Math.Max(_videoArea.Left, edge),
+            Right = r.Left + Math.Min(_videoArea.Right, r.Width - edge),
+            Top = r.Top + Math.Max(_videoArea.Top, edge),
+            Bottom = r.Top + Math.Min(_videoArea.Bottom, r.Height - edge),
+        };
+    }
+
     private bool IsOverVideo(Native.POINT p)
     {
         if (_hwnd == IntPtr.Zero)
             return false;
-        Native.GetWindowRect(_hwnd, out var r);
-        int edge = (int)Math.Round(ResizeBorderDip * Native.GetDpiForWindow(_hwnd) / 96.0);
-        int left = r.Left + Math.Max(_videoArea.Left, edge), right = r.Left + Math.Min(_videoArea.Right, r.Width - edge);
-        int top = r.Top + Math.Max(_videoArea.Top, edge), bottom = r.Top + Math.Min(_videoArea.Bottom, r.Height - edge);
-        return p.X >= left && p.X < right && p.Y >= top && p.Y < bottom;
+        var r = VideoScreenRect();
+        return p.X >= r.Left && p.X < r.Right && p.Y >= r.Top && p.Y < r.Bottom;
     }
 
-    /// <summary>Move the (invisible) real window so the point shown under <paramref name="p"/> is really under it.</summary>
-    private void AlignSourceUnder(Native.POINT p, bool async)
+    /// <summary>Move the (invisible) real window so the point shown under the cursor is really under it.</summary>
+    private void AlignSourceUnder(int px, int py, bool async)
     {
-        Native.GetWindowRect(_hwnd, out var pip);
-        Native.GetClientRect(Source, out var client);
-        double u = (p.X - pip.Left - _videoArea.Left) / (double)_videoArea.Width;
-        double v = (p.Y - pip.Top - _videoArea.Top) / (double)_videoArea.Height;
-        int x = (int)Math.Round(p.X - u * client.Width) - _frameOffsetX;
-        int y = (int)Math.Round(p.Y - v * client.Height) - _frameOffsetY;
+        if (_srcPinned)
+            return; // fullscreen: it cannot be moved, and it already covers the cursor anyway
 
-        // Async from the hook, so a busy app can never make the mouse lag.
-        uint flags = Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | (async ? Native.SWP_ASYNCWINDOWPOS : 0);
+        double u = (px - _pipLeft - _videoArea.Left) / (double)_videoArea.Width;
+        double v = (py - _pipTop - _videoArea.Top) / (double)_videoArea.Height;
+        int x = (int)Math.Round(px - u * _srcClientW) - _frameOffsetX;
+        int y = (int)Math.Round(py - v * _srcClientH) - _frameOffsetY;
+
+        // Moving a big window is what costs, so skip moves that change nothing visible.
+        // Near the app's real size that is almost all of them.
+        if (Math.Abs(x - _lastAlignX) <= 1 && Math.Abs(y - _lastAlignY) <= 1)
+            return;
+
+        // Cap the rate too: a fast mouse must never queue up more moves than the app can
+        // process, or everything behind them (like a click) arrives late.
+        long now = Environment.TickCount64;
+        if (async && now - _lastAlignTick < 7)
+            return; // the next move, or the 400ms watch tick, will realign
+        _lastAlignTick = now;
+        _lastAlignX = x;
+        _lastAlignY = y;
+
+        // Async, so a busy app can never make the mouse lag; no redraw, the content is unchanged.
+        uint flags = Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE
+                     | Native.SWP_NOREDRAW | Native.SWP_NOSENDCHANGING | (async ? Native.SWP_ASYNCWINDOWPOS : 0);
         Native.SetWindowPos(Source, IntPtr.Zero, x, y, 0, 0, flags);
         _sourceMoved = true;
     }
 
+    // Marks the mouse events this app plays back itself, so the hook can tell them from the
+    // user's (anything else, hardware or injected — a remote-control tool acts as the user).
+    private static readonly UIntPtr InjectTag = new(0x4D505049); // "MPPI"
+
+    // The hook runs for every mouse event on the whole PC, so the move path must stay tiny.
+    // Button and wheel events are rare, so they may do a little more: the hook eats them
+    // (returns 1) and the real work happens on the UI thread. Events we play back ourselves
+    // carry InjectTag in dwExtraInfo and are let through, so they reach the app.
     private IntPtr OnGlobalMouse(int code, IntPtr wParam, IntPtr lParam)
     {
-        if (code >= 0 && _interactive && wParam.ToInt32() == Native.WM_MOUSEMOVE)
+        if (code < 0 || !_interactive)
+            return Native.CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
+
+        int msg = wParam.ToInt32();
+        int x = Marshal.ReadInt32(lParam, 0), y = Marshal.ReadInt32(lParam, 4);
+        bool injected = Marshal.ReadInt64(lParam, 24) == (long)InjectTag; // ours, being played back
+        var r = _videoScreen;
+        bool inside = x >= r.Left && x < r.Right && y >= r.Top && y < r.Bottom;
+
+        switch (msg)
         {
-            var p = new Native.POINT { X = Marshal.ReadInt32(lParam, 0), Y = Marshal.ReadInt32(lParam, 4) };
-            if (IsOverVideo(p))
-                AlignSourceUnder(p, async: true);
-            else
-                _watch.Dispatcher.BeginInvoke(new Action(ExitInteract)); // not inside the hook: it talks to the other app
+            case Native.WM_MOUSEMOVE:
+                _hookX = x;
+                _hookY = y;
+                _lastMoveTick = Environment.TickCount64;
+                if (inside || _lPhase != 0 || _rPhase != 0) // a held button keeps the session alive
+                {
+                    if (_lPhase == 1 && Math.Abs(x - _downX) + Math.Abs(y - _downY) > DragThresholdPx)
+                        _lPhase = 2; // the press became a drag: the player follows the cursor
+                    if (Interlocked.Exchange(ref _alignQueued, 1) == 0)
+                        _watch.Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(ApplyQueuedAlign));
+                }
+                else
+                {
+                    int hx = x, hy = y; // not inside the hook: ExitInteract talks to the other app
+                    var vr = r;
+                    _watch.Dispatcher.BeginInvoke(DispatcherPriority.Send,
+                        new Action(() => ExitInteract($"hook cursor={hx},{hy} video={vr.Left},{vr.Top}-{vr.Right},{vr.Bottom}")));
+                }
+                break;
+
+            case WM_LBUTTONDOWN when !injected:
+                if (inside)
+                {
+                    _downX = x;
+                    _downY = y;
+                    Native.GetWindowRect(_hwnd, out var pip);
+                    _dragPipX = pip.Left;
+                    _dragPipY = pip.Top;
+                    _lPhase = 1;
+                }
+                else // never let a click fall into the invisible window: let go first, then replay it
+                    _watch.Dispatcher.BeginInvoke(DispatcherPriority.Send,
+                        new Action(() => ExitAndReplay(Native.MOUSEEVENTF_LEFTDOWN)));
+                return new IntPtr(1);
+
+            case WM_LBUTTONUP when !injected && _lPhase != 0:
+                int phase = _lPhase;
+                _lPhase = 0;
+                _watch.Dispatcher.BeginInvoke(DispatcherPriority.Send,
+                    phase == 2 ? new Action(EndPlayerDrag) : new Action(InjectClick));
+                return new IntPtr(1);
+
+            case WM_RBUTTONDOWN when !injected:
+                if (inside)
+                    _rPhase = 1;
+                else
+                    _watch.Dispatcher.BeginInvoke(DispatcherPriority.Send,
+                        new Action(() => ExitAndReplay(Native.MOUSEEVENTF_RIGHTDOWN)));
+                return new IntPtr(1);
+
+            case WM_RBUTTONUP when !injected && _rPhase != 0:
+                _rPhase = 0;
+                _watch.Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    ExitInteract("menu"); // the menu must own the mouse, not this hook
+                    ShowMenu();
+                }));
+                return new IntPtr(1);
+
+            case Native.WM_MOUSEWHEEL when !injected && inside:
+                short delta = (short)(Marshal.ReadInt32(lParam, 8) >> 16); // high word of mouseData
+                _watch.Dispatcher.BeginInvoke(new Action(() =>
+                    _zoom?.HandleMessage(Native.WM_MOUSEWHEEL, new IntPtr((long)(ushort)delta << 16))));
+                return new IntPtr(1); // the wheel resizes the player, never scrolls the app
         }
         return Native.CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
+    }
+
+    private void ApplyQueuedAlign()
+    {
+        Interlocked.Exchange(ref _alignQueued, 0);
+        if (!_interactive)
+            return;
+        if (_lPhase == 2) // dragging: the player follows the cursor; the app realigns on release
+        {
+            Native.SetWindowPos(_hwnd, IntPtr.Zero, _dragPipX + _hookX - _downX, _dragPipY + _hookY - _downY,
+                0, 0, Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+            RefreshInteractGeometry();
+            return;
+        }
+        if (_lPhase == 1 || _rPhase == 1)
+            return; // button held but no drag yet: hold everything still
+        RefreshInteractGeometry(); // a handful of cheap reads, and the hook stays tiny
+        AlignSourceUnder(_hookX, _hookY, async: true);
+    }
+
+    /// <summary>Play the click the hook ate back into the app, at the point the user sees.</summary>
+    private void InjectClick()
+    {
+        if (!_interactive)
+            return;
+        RefreshInteractGeometry();
+        Native.GetCursorPos(out var p);
+        if (Environment.GetEnvironmentVariable("MINIPLAYER_TRACE") == "1")
+            App.Log($"InjectClick: cursor={p.X},{p.Y} pinned={_srcPinned} src={_srcOriginX},{_srcOriginY} {_srcClientW}x{_srcClientH}");
+        if (_srcPinned)
+        {
+            // Fullscreen source: it cannot be lined up under the cursor, and warping the cursor
+            // to the point flashes a second pointer. Hand the click to the window directly.
+            double u = Math.Clamp((p.X - _pipLeft - _videoArea.Left) / (double)_videoArea.Width, 0, 1);
+            double v = Math.Clamp((p.Y - _pipTop - _videoArea.Top) / (double)_videoArea.Height, 0, 1);
+            var pt = new Native.POINT
+            {
+                X = _srcOriginX + (int)Math.Round(u * _srcClientW),
+                Y = _srcOriginY + (int)Math.Round(v * _srcClientH),
+            };
+            IntPtr target = InputChild(Source);
+            Native.ScreenToClient(target, ref pt);
+            IntPtr pos = new((pt.Y << 16) | (pt.X & 0xFFFF));
+            Native.PostMessage(target, Native.WM_MOUSEMOVE, IntPtr.Zero, pos);
+            Native.PostMessage(target, WM_LBUTTONDOWN, new IntPtr(1) /* MK_LBUTTON */, pos);
+            Native.PostMessage(target, WM_LBUTTONUP, IntPtr.Zero, pos);
+            Native.SetForegroundWindow(Source); // a real click would focus the app too (Esc, typing)
+            return;
+        }
+        AlignSourceUnder(p.X, p.Y, async: false);
+        // Let the app drain whatever is still queued (hover moves), so the click is handled now.
+        Native.SendMessageTimeout(Source, 0 /* WM_NULL */, IntPtr.Zero, IntPtr.Zero,
+            Native.SMTO_ABORTIFHUNG, 150, out _);
+        Native.mouse_event(Native.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, InjectTag);
+        Native.mouse_event(Native.MOUSEEVENTF_LEFTUP, 0, 0, 0, InjectTag);
+    }
+
+    /// <summary>The child window that takes a browser's input (web content), or the window itself.</summary>
+    private static IntPtr InputChild(IntPtr window)
+    {
+        IntPtr found = window;
+        Native.EnumChildWindows(window, (child, _) =>
+        {
+            if (Native.ClassName(child) != "Chrome_RenderWidgetHostHWND")
+                return true;
+            found = child;
+            return false;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    /// <summary>A click outside the video: step out of the way first, then let the click happen.</summary>
+    private void ExitAndReplay(uint buttonDown)
+    {
+        ExitInteract("click outside");
+        Native.mouse_event(buttonDown, 0, 0, 0, InjectTag);
+        Native.mouse_event(buttonDown << 1, 0, 0, 0, InjectTag); // the matching button-up
+    }
+
+    private void EndPlayerDrag()
+    {
+        if (!_interactive)
+            return;
+        RefreshInteractGeometry();
+        Native.GetCursorPos(out var p);
+        if (IsOverVideo(p))
+        {
+            _lastAlignX = int.MinValue;
+            AlignSourceUnder(p.X, p.Y, async: true);
+        }
+        else
+            ExitInteract("drag ended outside");
     }
 
     // ---- Win32 ----
@@ -506,7 +813,8 @@ public sealed class PipWindow
     private const uint SWP_FRAMECHANGED = 0x20, SWP_SHOWWINDOW = 0x40;
     private const int WM_DESTROY = 0x0002, WM_NCDESTROY = 0x0082, WM_GETMINMAXINFO = 0x0024;
     private const int WM_NCCALCSIZE = 0x0083, WM_NCHITTEST = 0x0084, WM_MOUSEACTIVATE = 0x0021;
-    private const int WM_LBUTTONDOWN = 0x0201, WM_LBUTTONDBLCLK = 0x0203, WM_RBUTTONUP = 0x0205, WM_DPICHANGED = 0x02E0;
+    private const int WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203;
+    private const int WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205, WM_DPICHANGED = 0x02E0;
     private const int MA_NOACTIVATE = 3, HTCLIENT = 1;
     private const int HTLEFT = 10, HTRIGHT = 11, HTTOP = 12, HTTOPLEFT = 13, HTTOPRIGHT = 14;
     private const int HTBOTTOM = 15, HTBOTTOMLEFT = 16, HTBOTTOMRIGHT = 17;

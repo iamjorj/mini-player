@@ -29,6 +29,9 @@ internal sealed class SmoothZoom : IDisposable
     /// <summary>The window that actually gets resized (defaults to the one receiving input).</summary>
     public IntPtr Target { get; set; }
 
+    /// <summary>True while a pinch or wheel zoom is in progress.</summary>
+    public bool Active => _inSession || _pinch?.Active == true;
+
     /// <summary>Raised before the first resize of a pinch/wheel zoom, and once it has fully settled.</summary>
     public event Action? ZoomStarting, ZoomEnded;
 

@@ -191,7 +191,7 @@
                     <TextBlock Grid.Row="1" Grid.Column="1" Text="Pinch on the touchpad to resize"/>
 
                     <TextBlock Grid.Row="2" Text="👆" FontSize="18" Margin="4,0,0,0"/>
-                    <TextBlock Grid.Row="2" Grid.Column="1" Text="Click to use the app · drag to move"/>
+                    <TextBlock Grid.Row="2" Grid.Column="1" Text="Point at it to use the app · drag to move"/>
                 </Grid>
 
                 <TextBlock Text="Try it here: drag this window, or pinch to resize it."
