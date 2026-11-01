@@ -32,6 +32,8 @@ public partial class App : Application
             return;
         }
 
+        Autostart.Heal(); // if registered to start with Windows and the exe moved, re-point it
+
         // If anything goes wrong, never leave a window stuck invisible.
         PipWindow.RecoverGhostedWindows();
         DispatcherUnhandledException += (_, _) => _pip?.CloseAndRestore();
@@ -63,6 +65,9 @@ public partial class App : Application
         var menu = new Forms.ContextMenuStrip();
         menu.Items.Add("Pop out active window: Ctrl+Alt+P").Enabled = false;
         menu.Items.Add(new Forms.ToolStripSeparator());
+        var autostart = new Forms.ToolStripMenuItem("Open automatically when my PC starts") { Checked = Autostart.Enabled };
+        autostart.Click += (_, _) => autostart.Checked = Autostart.Enabled = !Autostart.Enabled;
+        menu.Items.Add(autostart);
         menu.Items.Add("Exit", null, (_, _) => Shutdown());
 
         _tray = new Forms.NotifyIcon

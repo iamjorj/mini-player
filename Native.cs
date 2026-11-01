@@ -43,6 +43,7 @@ internal static class Native
     public const int GWL_EXSTYLE = -20;
     public const int WS_EX_TOOLWINDOW = 0x80;
     public const int WS_EX_TOPMOST = 0x8, WS_EX_TRANSPARENT = 0x20, WS_EX_LAYERED = 0x80000;
+    public const int WS_EX_NOACTIVATE = 0x08000000;
     public const uint LWA_ALPHA = 0x2;
     public const int SW_RESTORE = 9, SW_SHOWNOACTIVATE = 4, SW_HIDE = 0;
     public const uint GW_HWNDNEXT = 2, GW_OWNER = 4;

@@ -14,6 +14,8 @@ public partial class WelcomeWindow : Window
 {
     private static readonly string HiddenFlag = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MiniPlayer", "welcome-hidden");
+    private static readonly string AutostartChosenFlag = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MiniPlayer", "autostart-chosen");
 
     public static bool ShouldShow => !File.Exists(HiddenFlag);
 
@@ -23,6 +25,10 @@ public partial class WelcomeWindow : Window
     public WelcomeWindow()
     {
         InitializeComponent();
+        // Pre-checked on the very first run (this window is the "installer moment");
+        // once the user has answered, show their actual choice instead.
+        if (File.Exists(AutostartChosenFlag))
+            StartWithWindows.IsChecked = Autostart.Enabled;
 
         // Size the window to its content once, then lock that shape (it scales as one piece).
         Design.Measure(new Size(Design.Width, double.PositiveInfinity));
@@ -152,15 +158,15 @@ public partial class WelcomeWindow : Window
 
     private void OnGotIt(object sender, RoutedEventArgs e)
     {
-        if (DontShowAgain.IsChecked == true)
+        Autostart.Enabled = StartWithWindows.IsChecked == true;
+        try
         {
-            try
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(HiddenFlag)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(HiddenFlag)!);
+            File.WriteAllText(AutostartChosenFlag, "");
+            if (DontShowAgain.IsChecked == true)
                 File.WriteAllText(HiddenFlag, "");
-            }
-            catch (IOException) { }
         }
+        catch (IOException) { }
         Close();
     }
 }

@@ -46,13 +46,29 @@ public sealed class PipWindow
         _tame = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
         _tame.Tick += (_, _) =>
         {
+            // No focus handoff here: snatching the foreground on every click flickers the
+            // whole desktop and can dismiss menus the click just opened. The blanked dim
+            // window can neither draw nor swallow clicks even if the shell shows it.
             TameFullscreen(handOffFocus: false);
+            // It also snaps its fullscreen window home then; until realigned, the real
+            // hover bleeds at raw screen positions (highlighting whatever sits there).
+            if (_interactive && _srcPinned && _fsMovable
+                && Native.GetCursorPos(out var p) && IsOverVideo(p))
+            {
+                RefreshInteractGeometry();
+                AlignSourceUnder(p.X, p.Y, async: true);
+            }
             if (Environment.TickCount64 > _tameUntil)
                 _tame.Stop();
         };
         _click = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(60) };
         _click.Tick += (_, _) => FlushPendingClick();
+        _fingerLift = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150) };
+        _fingerLift.Tick += (_, _) => ReleaseFingers();
     }
+
+    // Restarted by every two-finger touchpad report; firing means the fingers really lifted.
+    private readonly DispatcherTimer _fingerLift;
 
     // After a click is posted to a fullscreen source, the app takes focus on its own a moment
     // later, and the shell starts dimming the screen for it (see TameFullscreen). Chasing it
@@ -164,8 +180,10 @@ public sealed class PipWindow
         Native.SetProp(Source, GhostStyleTag, new IntPtr(_sourceExStyle));
         Native.SetProp(Source, GhostPosTag, new IntPtr(((long)_sourceHome.Left << 32) | (uint)_sourceHome.Top));
 
+        // NOACTIVATE: clicks played into the ghost must never make it the foreground window —
+        // a fullscreen window taking the foreground makes the shell dim the screen for it.
         Native.SetWindowLong(Source, Native.GWL_EXSTYLE,
-            _sourceExStyle | Native.WS_EX_LAYERED | Native.WS_EX_TRANSPARENT);
+            _sourceExStyle | Native.WS_EX_LAYERED | Native.WS_EX_TRANSPARENT | Native.WS_EX_NOACTIVATE);
         Native.SetLayeredWindowAttributes(Source, 0, 1, Native.LWA_ALPHA);
         Native.SetWindowPos(Source, Native.HWND_TOPMOST, 0, 0, 0, 0,
             Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
@@ -188,6 +206,10 @@ public sealed class PipWindow
         if (_sourceMoved)
             Native.SetWindowPos(Source, IntPtr.Zero, _sourceHome.Left, _sourceHome.Top, 0, 0,
                 Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+        foreach (var w in _blankedPopups) // give the app its popups back
+            if (Native.IsWindow(w))
+                Native.SetWindowRgn(w, IntPtr.Zero, true);
+        _blankedPopups.Clear();
         RestoreStyle(Source, _sourceExStyle);
         if (_sourceHadAlpha)
             Native.SetLayeredWindowAttributes(Source, _sourceColorKey, _sourceAlpha, _sourceLayerFlags);
@@ -238,17 +260,26 @@ public sealed class PipWindow
         HideOwnedPopups();
     }
 
+    private readonly HashSet<IntPtr> _blankedPopups = new(); // given an empty region; restored on close
+
     /// <summary>
-    /// Hide the app's own little popup windows (link bubble, tooltips, the "press Esc to
-    /// exit full screen" toast): they would pop up at the invisible window's position.
+    /// Hide the app's own little popup windows (link bubble, tooltips, the "x is now full
+    /// screen" toast): they would pop up at the invisible window's position. The app re-shows
+    /// some of them faster than any hide, so they also get an empty region — a re-shown blank
+    /// window draws nothing. Regions are restored when the mini player closes.
     /// </summary>
     private void HideOwnedPopups()
     {
         Native.EnumWindows((w, _) =>
         {
-            if (Native.IsWindowVisible(w) && Native.GetWindow(w, Native.GW_OWNER) == Source
+            if (Native.GetWindow(w, Native.GW_OWNER) == Source
                 && Native.ClassName(w) is not ("IME" or "MSCTFIME UI")) // input-method UI stays
-                Native.ShowWindow(w, Native.SW_HIDE);
+            {
+                if (_blankedPopups.Add(w))
+                    Native.SetWindowRgn(w, Native.CreateRectRgn(0, 0, 0, 0), false);
+                if (Native.IsWindowVisible(w))
+                    Native.ShowWindow(w, Native.SW_HIDE);
+            }
             return true;
         }, IntPtr.Zero);
     }
@@ -265,11 +296,12 @@ public sealed class PipWindow
 
     private void TameFullscreen(bool handOffFocus)
     {
+        // An empty window region beats hiding: it sticks even when the shell shows the
+        // window again, leaving nothing to draw and nothing to swallow the mouse. The
+        // shell can reset it on re-show, so re-blank whenever it turns up visible.
         IntPtr dim = Native.FindWindow("Shell_SystemDim", null);
-        if (dim != IntPtr.Zero && dim != _dimNeutered)
+        if (dim != IntPtr.Zero && (dim != _dimNeutered || Native.IsWindowVisible(dim)))
         {
-            // An empty window region beats hiding: it sticks even when the shell shows the
-            // window again, leaving nothing to draw and nothing to swallow the mouse.
             Native.SetWindowRgn(dim, Native.CreateRectRgn(0, 0, 0, 0), false);
             Native.ShowWindow(dim, Native.SW_HIDE);
             _dimNeutered = dim;
@@ -399,17 +431,24 @@ public sealed class PipWindow
                 {
                     // With the cursor at rest, the window should sit where alignment put it.
                     // A fullscreen window found far away keeps snapping back (its app pins
-                    // it): after a few strikes, stop fighting and switch to posted hover.
+                    // it): after several strikes, stop fighting and switch to posted hover.
+                    // Snap-backs right after a click don't count — the app re-asserts its
+                    // fullscreen bounds when handling clicks, and realigning fixes those.
+                    long now = Environment.TickCount64;
                     if (_srcPinned && _lastAlignX != int.MinValue
-                        && Environment.TickCount64 - _lastMoveTick > 300
-                        && (Math.Abs(_srcOriginX - _frameOffsetX - _lastAlignX) > 64
-                            || Math.Abs(_srcOriginY - _frameOffsetY - _lastAlignY) > 64)
-                        && ++_fsFights >= 3)
+                        && now - _lastMoveTick > 300 && now - _lastClickTick > 1500)
                     {
-                        _fsMovable = false;
-                        ApplySourceInputStyle();
-                        if (App.Trace)
-                            App.Log("WatchSource: fullscreen window keeps snapping back; posted hover");
+                        bool displacedNow = Math.Abs(_srcOriginX - _frameOffsetX - _lastAlignX) > 64
+                            || Math.Abs(_srcOriginY - _frameOffsetY - _lastAlignY) > 64;
+                        if (!displacedNow)
+                            _fsFights = 0; // it held: this window is genuinely movable
+                        else if (++_fsFights >= 5)
+                        {
+                            _fsMovable = false;
+                            ApplySourceInputStyle();
+                            if (App.Trace)
+                                App.Log("WatchSource: fullscreen window keeps snapping back; posted hover");
+                        }
                     }
                     AlignSourceUnder(cursor.X, cursor.Y, async: true);
                 }
@@ -698,6 +737,7 @@ public sealed class PipWindow
         if (App.Trace)
             App.Log($"ExitInteract: {reason}");
         _interactive = false;
+        _fingerLift.Stop();
         _fingersDown = false;
         SetTouchpadWatch(false);
         _lPhase = _rPhase = 0;
@@ -778,6 +818,7 @@ public sealed class PipWindow
         int ex = Native.GetWindowLong(Source, Native.GWL_EXSTYLE);
         bool transparent = !_interactive || (_srcPinned && !_fsMovable) || _fingersDown;
         int want = transparent ? ex | Native.WS_EX_TRANSPARENT : ex & ~Native.WS_EX_TRANSPARENT;
+        want |= Native.WS_EX_NOACTIVATE; // never the foreground window (see GhostSource)
         if (want != ex)
             Native.SetWindowLong(Source, Native.GWL_EXSTYLE, want);
     }
@@ -796,8 +837,12 @@ public sealed class PipWindow
             dwFlags = on ? Native.RIDEV_INPUTSINK : Native.RIDEV_REMOVE,
             hwndTarget = on ? _hwnd : IntPtr.Zero,
         };
-        Native.RegisterRawInputDevices(ref rid, 1, (uint)Marshal.SizeOf<Native.RAWINPUTDEVICE>());
+        bool ok = Native.RegisterRawInputDevices(ref rid, 1, (uint)Marshal.SizeOf<Native.RAWINPUTDEVICE>());
+        if (App.Trace)
+            App.Log($"SetTouchpadWatch({on}): {ok}");
     }
+
+    private int _lastContacts = -1, _rawStatus; // trace only
 
     private void OnRawInput(IntPtr lParam)
     {
@@ -826,8 +871,14 @@ public sealed class PipWindow
         for (int i = 0; i < reports; i++)
         {
             Array.Copy(_rawBuf, 32 + (long)i * sizeHid, _reportBuf, 0, sizeHid);
-            if (Native.HidP_GetUsageValue(0 /* input */, 0x0D, 0, 0x54 /* contact count */,
-                    out uint contacts, prep, _reportBuf, (uint)sizeHid) == Native.HIDP_STATUS_SUCCESS)
+            int status = Native.HidP_GetUsageValue(0 /* input */, 0x0D, 0, 0x54 /* contact count */,
+                out uint contacts, prep, _reportBuf, (uint)sizeHid);
+            if (App.Trace && status != _rawStatus)
+            {
+                _rawStatus = status;
+                App.Log($"OnRawInput: HidP status=0x{status:X8} sizeHid={sizeHid}");
+            }
+            if (status == Native.HIDP_STATUS_SUCCESS)
                 OnTouchpadContacts((int)contacts);
         }
     }
@@ -851,21 +902,40 @@ public sealed class PipWindow
 
     private void OnTouchpadContacts(int contacts)
     {
-        if (contacts >= 2 && !_fingersDown)
+        if (App.Trace && contacts != _lastContacts)
         {
-            // Two fingers landed while hovering: a pinch (or two-finger gesture) is starting.
-            // Step out of its way now, before Windows picks its target window.
-            if (Native.GetCursorPos(out var p) && IsOverVideo(p))
+            _lastContacts = contacts;
+            Native.GetCursorPos(out var tp);
+            App.Log($"Contacts: {contacts} overVideo={IsOverVideo(tp)} fingersDown={_fingersDown}");
+        }
+        if (contacts >= 2)
+        {
+            // Two fingers on the touchpad: the gesture is the player's. Step out of its way
+            // now, before Windows picks its target window, and STAY out until they lift.
+            if (!_fingersDown && Native.GetCursorPos(out var p) && IsOverVideo(p))
             {
                 _fingersDown = true;
                 ApplySourceInputStyle();
             }
+            _fingerLift.Stop(); // reports keep flowing while fingers are down
+            _fingerLift.Start();
         }
-        else if (contacts < 2 && _fingersDown)
+        else if (contacts == 1)
         {
-            _fingersDown = false; // fingers lifted: hover is the app's again
-            ApplySourceInputStyle();
+            ReleaseFingers(); // back to one finger: ordinary pointing
         }
+        // contacts == 0 is NOT a lift: touchpads split one frame across several reports and
+        // only the first carries the real count — continuation reports say 0. A real lift
+        // simply stops the reports, which the timer above catches.
+    }
+
+    private void ReleaseFingers()
+    {
+        _fingerLift.Stop();
+        if (!_fingersDown)
+            return;
+        _fingersDown = false;
+        ApplySourceInputStyle();
     }
 
     /// <summary>
@@ -1119,6 +1189,9 @@ public sealed class PipWindow
             Native.SMTO_ABORTIFHUNG, 150, out _);
         Native.mouse_event(Native.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, InjectTag);
         Native.mouse_event(Native.MOUSEEVENTF_LEFTUP, 0, 0, 0, InjectTag);
+        // NOACTIVATE stops clicks from focusing the ghost, so grant focus explicitly here —
+        // a windowed source is not fullscreen, so no shell dim can come of it. Typing works.
+        Native.SetForegroundWindow(Source);
     }
 
     /// <summary>

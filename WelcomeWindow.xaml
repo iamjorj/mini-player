@@ -198,8 +198,12 @@
                            Foreground="#7FA6FF" FontSize="13" Margin="0,20,0,0"/>
 
                 <DockPanel Margin="0,22,0,0">
-                    <CheckBox x:Name="DontShowAgain" Content="Don't show again" Foreground="#A0A3A8"
-                              VerticalAlignment="Center" DockPanel.Dock="Left"/>
+                    <StackPanel DockPanel.Dock="Left" VerticalAlignment="Center">
+                        <CheckBox x:Name="StartWithWindows" Content="Open automatically when my PC starts" Foreground="#A0A3A8"
+                                  IsChecked="True"/>
+                        <CheckBox x:Name="DontShowAgain" Content="Don't show again" Foreground="#A0A3A8"
+                                  Margin="0,6,0,0"/>
+                    </StackPanel>
                     <Button Content="Got it" Style="{StaticResource PrimaryButton}" HorizontalAlignment="Right"
                             IsDefault="True" Click="OnGotIt"/>
                 </DockPanel>
